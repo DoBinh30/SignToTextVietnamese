@@ -45,7 +45,7 @@ CHARACTER_OVERRIDES = {"SPACE": " "}
 # Gesture handling parameters tuned to reduce accidental activations while keeping
 # dynamic gestures responsive.
 STATIC_HOLD_DURATION = 0.2  # seconds
-DYNAMIC_GESTURE_LABELS = {"J", "Z"}
+DYNAMIC_GESTURE_LABELS = {"j", "z"}
 NO_OUTPUT_LABEL = "NO_OUTPUT"
 
 # Prediction stabilisation parameters chosen to balance responsiveness and
@@ -318,7 +318,7 @@ def main() -> None:
 
                 if (
                     predicted_character in DYNAMIC_GESTURE_LABELS
-                    and confidence >= MIN_CONFIDENCE
+                    # and confidence >= MIN_CONFIDENCE
                 ):
                     stable_label = predicted_character
                     stabiliser.reset()
