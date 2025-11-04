@@ -44,7 +44,7 @@ CHARACTER_OVERRIDES = {"SPACE": " "}
 
 # Gesture handling parameters tuned to reduce accidental activations while keeping
 # dynamic gestures responsive.
-STATIC_HOLD_DURATION = 0.3  # seconds
+STATIC_HOLD_DURATION = 0.2  # seconds
 DYNAMIC_GESTURE_LABELS = {"J", "Z"}
 NO_OUTPUT_LABEL = "NO_OUTPUT"
 
@@ -61,11 +61,14 @@ class TkinterTextDisplay:
 
     def __init__(self, *, width: int = 720, height: int = 480) -> None:
         self._closed = False
+        self._quit_requested = False
         self._root = tk.Tk()
         self._root.title(TEXT_WINDOW_NAME)
         self._root.configure(bg="#f2f2f2")
         self._root.geometry(f"{width}x{height}")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._root.bind("<KeyRelease-q>", self._on_quit_key)
+        self._root.bind("<KeyRelease-Q>", self._on_quit_key)
 
         self._heading_font = self._create_font(size=28, weight="bold")
         self._body_font = self._create_font(size=20)
@@ -144,7 +147,7 @@ class TkinterTextDisplay:
                 var.set("")
 
     def pump_events(self) -> bool:
-        if self._closed:
+        if self._closed or self._quit_requested:
             return False
         try:
             self._root.update_idletasks()
@@ -162,6 +165,10 @@ class TkinterTextDisplay:
     def _on_close(self) -> None:
         self._closed = True
         self._root.destroy()
+
+    def _on_quit_key(self, _event: object) -> None:
+        self._quit_requested = True
+        self._on_close()
 
 
 class PredictionStabiliser:
@@ -262,6 +269,7 @@ def main() -> None:
     cooldown_frames = 0
     active_label: Optional[str] = None
     active_label_since: Optional[float] = None
+    last_written_label: Optional[str] = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
@@ -315,13 +323,19 @@ def main() -> None:
                     stable_label = predicted_character
                     stabiliser.reset()
 
+                cooldown_blocked = False
                 if cooldown_frames > 0:
                     cooldown_frames -= 1
                     if stable_label is not None:
-                        stabiliser.reset()
-                        active_label = None
-                        active_label_since = None
-                    stable_label = None
+                        if stable_label in DYNAMIC_GESTURE_LABELS:
+                            cooldown_frames = 0
+                        else:
+                            stabiliser.reset()
+                            active_label = None
+                            active_label_since = None
+                            cooldown_blocked = True
+                    if cooldown_blocked:
+                        stable_label = None
 
                 if stable_label is not None:
                     now = monotonic()
@@ -339,29 +353,45 @@ def main() -> None:
                     )
 
                     if hold_satisfied:
-                        normalized = normalise_label(stable_label)
+                        should_commit = True
+                        if stable_label not in {
+                            DELETE_CHARACTER_LABEL,
+                            CLEAR_TEXT_LABEL,
+                            ACCEPT_SUGGESTION_LABEL,
+                        } and stable_label == last_written_label:
+                            should_commit = False
 
-                        if stable_label == DELETE_CHARACTER_LABEL:
-                            if confirmed_text:
-                                confirmed_text.pop()
-                        elif stable_label == CLEAR_TEXT_LABEL:
-                            confirmed_text.clear()
-                        elif stable_label == ACCEPT_SUGGESTION_LABEL:
-                            composed = "".join(confirmed_text)
-                            suggestion = suggester.best_suggestion(composed)
-                            if suggestion:
-                                confirmed_text = list(
-                                    suggester.apply_suggestion(composed, suggestion)
-                                )
-                        elif stable_label == NO_OUTPUT_LABEL:
-                            pass
-                        else:
-                            confirmed_text.append(normalized)
+                        if should_commit:
+                            normalized = normalise_label(stable_label)
 
-                        cooldown_frames = POST_CONFIRM_COOLDOWN
-                        stabiliser.reset()
-                        active_label = None
-                        active_label_since = None
+                            if stable_label == DELETE_CHARACTER_LABEL:
+                                if confirmed_text:
+                                    confirmed_text.pop()
+                                last_written_label = None
+                            elif stable_label == CLEAR_TEXT_LABEL:
+                                confirmed_text.clear()
+                                last_written_label = None
+                            elif stable_label == ACCEPT_SUGGESTION_LABEL:
+                                composed = "".join(confirmed_text)
+                                suggestion = suggester.best_suggestion(composed)
+                                if suggestion:
+                                    confirmed_text = list(
+                                        suggester.apply_suggestion(composed, suggestion)
+                                    )
+                                last_written_label = None
+                            elif stable_label == NO_OUTPUT_LABEL:
+                                last_written_label = NO_OUTPUT_LABEL
+                            else:
+                                confirmed_text.append(normalized)
+                                last_written_label = stable_label
+
+                            if stable_label not in DYNAMIC_GESTURE_LABELS:
+                                cooldown_frames = POST_CONFIRM_COOLDOWN
+                            else:
+                                cooldown_frames = 0
+                            stabiliser.reset()
+                            active_label = None
+                            active_label_since = None
                 else:
                     active_label = None
                     active_label_since = None
