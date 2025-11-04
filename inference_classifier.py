@@ -1,118 +1,119 @@
+"""Realtime sign language inference supporting dynamic gestures."""
+from __future__ import annotations
+
+import argparse
 import pickle
+from pathlib import Path
+from typing import Optional
 
 import cv2
 import mediapipe as mp
-import numpy as np
+from sign_language import HandLandmarkExtractor, LandmarkSequenceBuilder
 
-model_dict = pickle.load(open('./model.p', 'rb'))
-model = model_dict['model']
 
-cap = cv2.VideoCapture(0)
+DEFAULT_MODEL_PATH = Path("model.p")
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
 
-# Use tracking mode (video) with a single hand and some tracking confidence
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1,
-                       min_detection_confidence=0.3, min_tracking_confidence=0.5)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=DEFAULT_MODEL_PATH,
+        help="Path to trained model file.",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="OpenCV camera index to use.",
+    )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.3,
+        help="Minimum detection confidence for MediaPipe Hands.",
+    )
+    return parser.parse_args()
 
-labels_dict = {0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E', 5: 'F', 6: 'G', 7: 'H', 8: 'I', 9: 'J',
-               10: 'K', 11: 'L', 12: 'M', 13: 'N', 14: 'O', 15: 'P', 16: 'Q', 17: 'R', 18: 'S', 19: 'T',
-               20: 'U', 21: 'V', 22: 'W', 23: 'X', 24: 'Y', 25: 'Z'}
 
-while True:
+def load_model(path: Path):
+    with path.open("rb") as f:
+        model_dict = pickle.load(f)
+    if "model" not in model_dict or "label_encoder" not in model_dict:
+        raise ValueError("Model file does not contain required keys")
+    sequence_length = model_dict.get("sequence_length")
+    if sequence_length is None:
+        raise ValueError("Model file missing sequence_length metadata")
+    return model_dict["model"], model_dict["label_encoder"], sequence_length
 
-    data_aux = []
-    x_ = []
-    y_ = []
 
-    ret, frame = cap.read()
-    frame = cv2.flip(frame, 1)
-    if not ret or frame is None:
-        # camera failed to provide a frame right now; skip this iteration
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        continue
+def main() -> None:
+    args = parse_args()
+    if not args.model_path.exists():
+        raise FileNotFoundError(f"Model not found: {args.model_path}")
 
-    H, W, _ = frame.shape
+    model, label_encoder, sequence_length = load_model(args.model_path)
+    sequence_builder = LandmarkSequenceBuilder(sequence_length=sequence_length)
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    cap = cv2.VideoCapture(args.camera_index)
+    if not cap.isOpened():
+        raise RuntimeError("Unable to open camera")
 
-    results = hands.process(frame_rgb)
+    mp_drawing = mp.solutions.drawing_utils
+    mp_styles = mp.solutions.drawing_styles
 
-     # Tạo canvas nếu chưa có
-    if 'canvas' not in locals():
-        canvas = np.zeros_like(frame, dtype=np.uint8)
+    predicted_character: Optional[str] = None
 
-    fade_rate = 0.92  # giảm giá trị này để chữ mờ nhanh hơn
-    canvas = (canvas * fade_rate).astype(np.uint8)
-    
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                frame,  # image to draw
-                hand_landmarks,  # model output
-                mp_hands.HAND_CONNECTIONS,  # hand connections
-                mp_drawing_styles.get_default_hand_landmarks_style(),
-                mp_drawing_styles.get_default_hand_connections_style())
+    with HandLandmarkExtractor(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=args.confidence,
+        min_tracking_confidence=0.5,
+    ) as extractor:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
-            for i in range(len(hand_landmarks.landmark)):
-                x = hand_landmarks.landmark[i].x
-                y = hand_landmarks.landmark[i].y
+            frame = cv2.flip(frame, 1)
+            result = extractor.extract(frame)
+            sequence_builder.append(result.features if result else None)
 
-                x_.append(x)
-                y_.append(y)
+            if result and result.hand_landmarks:
+                mp_drawing.draw_landmarks(
+                    frame,
+                    result.hand_landmarks,
+                    mp.solutions.hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style(),
+                )
 
-            for i in range(len(hand_landmarks.landmark)):
-                x = hand_landmarks.landmark[i].x
-                y = hand_landmarks.landmark[i].y
-                data_aux.append(x - min(x_))
-                data_aux.append(y - min(y_))
+            if sequence_builder.is_ready():
+                features = sequence_builder.as_flattened().reshape(1, -1)
+                prediction = model.predict(features)
+                predicted_character = label_encoder.inverse_transform(prediction)[0]
 
-            # Vẽ hiệu ứng viết chữ bằng đầu ngón trỏ (landmark 8)
-            x_tip = int(hand_landmarks.landmark[8].x * W)
-            y_tip = int(hand_landmarks.landmark[8].y * H)
-            cv2.circle(canvas, (x_tip, y_tip), 10, (255, 255, 255), -1)
+            if predicted_character:
+                cv2.putText(
+                    frame,
+                    predicted_character,
+                    (50, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    3,
+                    (0, 0, 0),
+                    6,
+                )
 
-        x1 = int(min(x_) * W) - 10
-        y1 = int(min(y_) * H) - 10
-
-        x2 = int(max(x_) * W) - 10
-        y2 = int(max(y_) * H) - 10
-
-        # Clamp coordinates to image bounds
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(W - 1, x2)
-        y2 = min(H - 1, y2)
-
-        # If box is invalid (possible when landmarks are out of frame), skip prediction
-        if x2 <= x1 or y2 <= y1 or len(data_aux) == 0:
-            cv2.imshow('frame', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.imshow("Sign Language Recognition", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-            continue
 
-        # Safely run prediction; if it fails, skip showing a label
-        predicted_character = None
-        try:
-            prediction = model.predict([np.asarray(data_aux)])
-            predicted_character = labels_dict[int(prediction[0])]
-        except Exception:
-            predicted_character = None
-
-        if predicted_character is not None:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 4)
-            cv2.putText(frame, predicted_character, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 0), 3,
-                        cv2.LINE_AA)
-
-    blended = cv2.addWeighted(frame, 1.0, canvas, 0.6, 0)
-    cv2.imshow('frame', blended)
-    # Allow quitting with 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    cap.release()
+    cv2.destroyAllWindows()
 
 
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()

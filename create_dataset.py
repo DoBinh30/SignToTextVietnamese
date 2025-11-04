@@ -1,50 +1,53 @@
-import os
+"""Create dataset from images and videos."""
+from __future__ import annotations
+
+import argparse
 import pickle
+from pathlib import Path
 
-import mediapipe as mp
-import cv2
-import matplotlib.pyplot as plt
+from sign_language import build_dataset
 
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=Path("data/images"),
+        help="Directory containing per-label subdirectories of images.",
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=Path,
+        default=Path("data/videos"),
+        help="Directory containing per-label subdirectories of videos.",
+    )
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=30,
+        help="Number of frames to represent each sample.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data_sequence.pickle"),
+        help="Path to save the dataset pickle file.",
+    )
+    return parser.parse_args()
 
-hands = mp_hands.Hands(static_image_mode=True, min_detection_confidence=0.3)
 
-DATA_DIR = './data'
+def main() -> None:
+    args = parse_args()
+    dataset = build_dataset(
+        image_dir=args.image_dir if args.image_dir.exists() else None,
+        video_dir=args.video_dir if args.video_dir.exists() else None,
+        sequence_length=args.sequence_length,
+    )
+    with args.output.open("wb") as f:
+        pickle.dump(dataset, f)
+    print(f"Saved dataset with {len(dataset['data'])} samples to {args.output}")
 
-data = []
-labels = []
-for dir_ in os.listdir(DATA_DIR):
-    for img_path in os.listdir(os.path.join(DATA_DIR, dir_)):
-        data_aux = []
 
-        x_ = []
-        y_ = []
-
-        img = cv2.imread(os.path.join(DATA_DIR, dir_, img_path))
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        results = hands.process(img_rgb)
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                for i in range(len(hand_landmarks.landmark)):
-                    x = hand_landmarks.landmark[i].x
-                    y = hand_landmarks.landmark[i].y
-
-                    x_.append(x)
-                    y_.append(y)
-
-                for i in range(len(hand_landmarks.landmark)):
-                    x = hand_landmarks.landmark[i].x
-                    y = hand_landmarks.landmark[i].y
-                    data_aux.append(x - min(x_))
-                    data_aux.append(y - min(y_))
-
-            data.append(data_aux)
-            labels.append(dir_)
-
-f = open('data.pickle', 'wb')
-pickle.dump({'data': data, 'labels': labels}, f)
-f.close()
+if __name__ == "__main__":
+    main()
