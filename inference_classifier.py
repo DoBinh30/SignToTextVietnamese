@@ -20,6 +20,7 @@ hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1,
 labels_dict = {0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E', 5: 'F', 6: 'G', 7: 'H', 8: 'I', 9: 'J',
                10: 'K', 11: 'L', 12: 'M', 13: 'N', 14: 'O', 15: 'P', 16: 'Q', 17: 'R', 18: 'S', 19: 'T',
                20: 'U', 21: 'V', 22: 'W', 23: 'X', 24: 'Y', 25: 'Z'}
+
 while True:
 
     data_aux = []
@@ -39,6 +40,14 @@ while True:
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     results = hands.process(frame_rgb)
+
+     # Tạo canvas nếu chưa có
+    if 'canvas' not in locals():
+        canvas = np.zeros_like(frame, dtype=np.uint8)
+
+    fade_rate = 0.92  # giảm giá trị này để chữ mờ nhanh hơn
+    canvas = (canvas * fade_rate).astype(np.uint8)
+    
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
             mp_drawing.draw_landmarks(
@@ -48,7 +57,6 @@ while True:
                 mp_drawing_styles.get_default_hand_landmarks_style(),
                 mp_drawing_styles.get_default_hand_connections_style())
 
-        for hand_landmarks in results.multi_hand_landmarks:
             for i in range(len(hand_landmarks.landmark)):
                 x = hand_landmarks.landmark[i].x
                 y = hand_landmarks.landmark[i].y
@@ -61,6 +69,11 @@ while True:
                 y = hand_landmarks.landmark[i].y
                 data_aux.append(x - min(x_))
                 data_aux.append(y - min(y_))
+
+            # Vẽ hiệu ứng viết chữ bằng đầu ngón trỏ (landmark 8)
+            x_tip = int(hand_landmarks.landmark[8].x * W)
+            y_tip = int(hand_landmarks.landmark[8].y * H)
+            cv2.circle(canvas, (x_tip, y_tip), 10, (255, 255, 255), -1)
 
         x1 = int(min(x_) * W) - 10
         y1 = int(min(y_) * H) - 10
@@ -94,7 +107,8 @@ while True:
             cv2.putText(frame, predicted_character, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 0), 3,
                         cv2.LINE_AA)
 
-    cv2.imshow('frame', frame)
+    blended = cv2.addWeighted(frame, 1.0, canvas, 0.6, 0)
+    cv2.imshow('frame', blended)
     # Allow quitting with 'q'
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
