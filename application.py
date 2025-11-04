@@ -1,9 +1,9 @@
-"""Realtime sign language inference supporting dynamic gestures.
+"""Realtime sign language inference with a Tkinter transcription display.
 
-The script renders a refined UI suitable for product usage:
+The application offers a modernised user experience:
 
-* A dedicated text canvas shows the confirmed transcription and Vietnamese
-  language suggestions.
+* A Tkinter window shows the recognised text and Vietnamese word suggestions
+  using large, high-quality fonts that render Unicode characters accurately.
 * Frame-level predictions are stabilised to avoid false positives while keeping
   gesture recognition responsive.
 * Special gesture labels enable users to delete characters, clear the entire
@@ -15,13 +15,14 @@ import argparse
 from collections import Counter, deque
 import pickle
 from pathlib import Path
+from time import monotonic
 from typing import Deque, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from time import monotonic
+import tkinter as tk
+from tkinter import font as tkfont
 
 from sign_language import HandLandmarkExtractor, LandmarkSequenceBuilder
 from sign_language.vietnamese_suggester import VietnameseWordSuggester
@@ -55,31 +56,112 @@ MIN_CONFIDENCE = 0.6
 POST_CONFIRM_COOLDOWN = 5
 
 
-FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-)
-_FONT_CACHE: dict[int, ImageFont.ImageFont] = {}
+class TkinterTextDisplay:
+    """Render recognised text and suggestions via Tkinter widgets."""
 
+    def __init__(self, *, width: int = 720, height: int = 480) -> None:
+        self._closed = False
+        self._root = tk.Tk()
+        self._root.title(TEXT_WINDOW_NAME)
+        self._root.configure(bg="#f2f2f2")
+        self._root.geometry(f"{width}x{height}")
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-def _load_font(size: int) -> ImageFont.ImageFont:
-    if size in _FONT_CACHE:
-        return _FONT_CACHE[size]
+        self._heading_font = self._create_font(size=28, weight="bold")
+        self._body_font = self._create_font(size=20)
+        self._suggestion_font = self._create_font(size=22)
 
-    for path in FONT_CANDIDATES:
-        font_path = Path(path)
-        if font_path.exists():
+        container = tk.Frame(self._root, bg="#ffffff", bd=0, highlightthickness=0)
+        container.pack(fill="both", expand=True, padx=24, pady=24)
+
+        text_section = tk.Frame(container, bg="#ffffff")
+        text_section.pack(fill="both", expand=True)
+
+        tk.Label(
+            text_section,
+            text="Văn bản",
+            font=self._heading_font,
+            bg="#ffffff",
+            fg="#202020",
+            anchor="w",
+        ).pack(fill="x")
+
+        self._text_var = tk.StringVar()
+        self._text_label = tk.Label(
+            text_section,
+            textvariable=self._text_var,
+            font=self._body_font,
+            bg="#ffffff",
+            fg="#303030",
+            wraplength=width - 96,
+            justify="left",
+        )
+        self._text_label.pack(fill="both", expand=True, pady=(12, 24))
+
+        suggestion_section = tk.Frame(container, bg="#ffffff")
+        suggestion_section.pack(fill="x", pady=(0, 12))
+
+        tk.Label(
+            suggestion_section,
+            text="Gợi ý",
+            font=self._heading_font,
+            bg="#ffffff",
+            fg="#202020",
+            anchor="w",
+        ).pack(fill="x")
+
+        self._suggestion_vars: List[tk.StringVar] = [tk.StringVar() for _ in range(3)]
+        for var in self._suggestion_vars:
+            tk.Label(
+                suggestion_section,
+                textvariable=var,
+                font=self._suggestion_font,
+                bg="#ffffff",
+                fg="#404040",
+                anchor="w",
+            ).pack(fill="x", pady=(6, 0))
+
+    def _create_font(self, *, size: int, weight: str = "normal") -> tkfont.Font:
+        preferred_families = [
+            "Noto Sans",
+            "DejaVu Sans",
+            "Arial",
+            "Helvetica",
+        ]
+        for family in preferred_families:
             try:
-                font = ImageFont.truetype(str(font_path), size)
-            except OSError:
+                return tkfont.Font(family=family, size=size, weight=weight)
+            except tk.TclError:
                 continue
-            _FONT_CACHE[size] = font
-            return font
+        return tkfont.Font(size=size, weight=weight)
 
-    fallback = ImageFont.load_default()
-    _FONT_CACHE[size] = fallback
-    return fallback
+    def update(self, text: str, suggestions: Sequence[str]) -> None:
+        self._text_var.set(text or "")
+        for idx, var in enumerate(self._suggestion_vars):
+            if idx < len(suggestions):
+                var.set(f"{idx + 1}. {suggestions[idx]}")
+            else:
+                var.set("")
+
+    def pump_events(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            self._root.update_idletasks()
+            self._root.update()
+        except tk.TclError:
+            self._closed = True
+            return False
+        return True
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._root.destroy()
+
+    def _on_close(self) -> None:
+        self._closed = True
+        self._root.destroy()
 
 
 class PredictionStabiliser:
@@ -118,76 +200,6 @@ class PredictionStabiliser:
         if count < self._min_consensus:
             return None
         return candidate
-
-
-def _wrap_text(text: str, *, font: ImageFont.ImageFont, max_width: int) -> List[str]:
-    if not text:
-        return []
-
-    words = text.split()
-    if not words:
-        return [text]
-
-    lines: List[str] = []
-    current_line: List[str] = []
-
-    for word in words:
-        test_line = " ".join(current_line + [word]).strip()
-        if font.getlength(test_line) <= max_width:
-            current_line.append(word)
-            continue
-
-        if current_line:
-            lines.append(" ".join(current_line))
-        current_line = [word]
-
-    if current_line:
-        lines.append(" ".join(current_line))
-
-    return lines
-
-
-def build_text_canvas(
-    recognized_text: str,
-    suggestions: Sequence[str],
-    *,
-    width: int = 720,
-    height: int = 480,
-) -> np.ndarray:
-    image = Image.new("RGB", (width, height), (240, 240, 240))
-    draw = ImageDraw.Draw(image)
-
-    border_rect = (20, 20, width - 20, height - 20)
-    draw.rounded_rectangle(border_rect, radius=20, fill=(255, 255, 255), outline=(200, 200, 200), width=3)
-
-    title_font = _load_font(40)
-    body_font = _load_font(28)
-    suggestion_font = _load_font(30)
-
-    draw.text((40, 50), "Văn bản", fill=(30, 30, 30), font=title_font)
-
-    text_area_width = width - 80
-    wrapped_lines = _wrap_text(recognized_text, font=body_font, max_width=text_area_width)
-    y_offset = 120
-    max_lines = 8
-    line_spacing = int(body_font.size * 1.3)
-    for line in wrapped_lines[:max_lines]:
-        draw.text((40, y_offset), line, fill=(50, 50, 50), font=body_font)
-        y_offset += line_spacing
-
-    draw.text((40, height - 170), "Gợi ý", fill=(60, 60, 60), font=title_font)
-
-    suggestion_spacing = int(suggestion_font.size * 1.4)
-    for idx, suggestion in enumerate(suggestions[:3], start=1):
-        draw.text(
-            (40, height - 170 + idx * suggestion_spacing),
-            f"{idx}. {suggestion}",
-            fill=(80, 80, 80),
-            font=suggestion_font,
-        )
-
-    canvas = np.array(image)[:, :, ::-1]
-    return canvas
 
 
 def normalise_label(label: str) -> str:
@@ -252,7 +264,8 @@ def main() -> None:
     active_label_since: Optional[float] = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(TEXT_WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+    text_display = TkinterTextDisplay()
 
     with HandLandmarkExtractor(
         static_image_mode=False,
@@ -368,13 +381,13 @@ def main() -> None:
                 )
 
             cv2.imshow(WINDOW_NAME, frame)
-            text_canvas = build_text_canvas(composed_text, suggestions)
-            cv2.imshow(TEXT_WINDOW_NAME, text_canvas)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            text_display.update(composed_text, suggestions)
+            if not text_display.pump_events() or cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     cap.release()
     cv2.destroyAllWindows()
+    text_display.close()
 
 
 if __name__ == "__main__":
