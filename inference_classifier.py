@@ -14,13 +14,14 @@ from __future__ import annotations
 import argparse
 from collections import Counter, deque
 import pickle
-import textwrap
 from pathlib import Path
 from typing import Deque, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from time import monotonic
 
 from sign_language import HandLandmarkExtractor, LandmarkSequenceBuilder
 from sign_language.vietnamese_suggester import VietnameseWordSuggester
@@ -40,12 +41,45 @@ ACCEPT_SUGGESTION_LABEL = "ACCEPT_SUGGESTION"
 # literal "SPACE" inserts an actual whitespace character).
 CHARACTER_OVERRIDES = {"SPACE": " "}
 
+# Gesture handling parameters tuned to reduce accidental activations while keeping
+# dynamic gestures responsive.
+STATIC_HOLD_DURATION = 0.3  # seconds
+DYNAMIC_GESTURE_LABELS = {"J", "Z"}
+NO_OUTPUT_LABEL = "NO_OUTPUT"
+
 # Prediction stabilisation parameters chosen to balance responsiveness and
 # robustness when handling rapid gesture sequences from video input.
 HISTORY_SIZE = 8
 MIN_CONSENSUS = 4
 MIN_CONFIDENCE = 0.6
 POST_CONFIRM_COOLDOWN = 5
+
+
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+)
+_FONT_CACHE: dict[int, ImageFont.ImageFont] = {}
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+
+    for path in FONT_CANDIDATES:
+        font_path = Path(path)
+        if font_path.exists():
+            try:
+                font = ImageFont.truetype(str(font_path), size)
+            except OSError:
+                continue
+            _FONT_CACHE[size] = font
+            return font
+
+    fallback = ImageFont.load_default()
+    _FONT_CACHE[size] = fallback
+    return fallback
 
 
 class PredictionStabiliser:
@@ -86,65 +120,73 @@ class PredictionStabiliser:
         return candidate
 
 
+def _wrap_text(text: str, *, font: ImageFont.ImageFont, max_width: int) -> List[str]:
+    if not text:
+        return []
+
+    words = text.split()
+    if not words:
+        return [text]
+
+    lines: List[str] = []
+    current_line: List[str] = []
+
+    for word in words:
+        test_line = " ".join(current_line + [word]).strip()
+        if font.getlength(test_line) <= max_width:
+            current_line.append(word)
+            continue
+
+        if current_line:
+            lines.append(" ".join(current_line))
+        current_line = [word]
+
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    return lines
+
+
 def build_text_canvas(
     recognized_text: str,
     suggestions: Sequence[str],
     *,
-    width: int = 600,
-    height: int = 400,
+    width: int = 720,
+    height: int = 480,
 ) -> np.ndarray:
-    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
-    cv2.rectangle(canvas, (10, 10), (width - 10, height - 10), (200, 200, 200), 2)
+    image = Image.new("RGB", (width, height), (240, 240, 240))
+    draw = ImageDraw.Draw(image)
 
-    cv2.putText(
-        canvas,
-        "Văn bản",
-        (30, 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.2,
-        (40, 40, 40),
-        2,
-        cv2.LINE_AA,
-    )
+    border_rect = (20, 20, width - 20, height - 20)
+    draw.rounded_rectangle(border_rect, radius=20, fill=(255, 255, 255), outline=(200, 200, 200), width=3)
 
-    wrapped_lines = textwrap.wrap(recognized_text, width=32)
-    y_offset = 90
-    for line in wrapped_lines[:8]:
-        cv2.putText(
-            canvas,
-            line,
-            (30, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (20, 20, 20),
-            2,
-            cv2.LINE_AA,
-        )
-        y_offset += 40
+    title_font = _load_font(40)
+    body_font = _load_font(28)
+    suggestion_font = _load_font(30)
 
-    cv2.putText(
-        canvas,
-        "Gợi ý",
-        (30, height - 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (70, 70, 70),
-        2,
-        cv2.LINE_AA,
-    )
+    draw.text((40, 50), "Văn bản", fill=(30, 30, 30), font=title_font)
 
+    text_area_width = width - 80
+    wrapped_lines = _wrap_text(recognized_text, font=body_font, max_width=text_area_width)
+    y_offset = 120
+    max_lines = 8
+    line_spacing = int(body_font.size * 1.3)
+    for line in wrapped_lines[:max_lines]:
+        draw.text((40, y_offset), line, fill=(50, 50, 50), font=body_font)
+        y_offset += line_spacing
+
+    draw.text((40, height - 170), "Gợi ý", fill=(60, 60, 60), font=title_font)
+
+    suggestion_spacing = int(suggestion_font.size * 1.4)
     for idx, suggestion in enumerate(suggestions[:3], start=1):
-        cv2.putText(
-            canvas,
+        draw.text(
+            (40, height - 170 + idx * suggestion_spacing),
             f"{idx}. {suggestion}",
-            (30, height - 120 + idx * 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            (50, 50, 50),
-            2,
-            cv2.LINE_AA,
+            fill=(80, 80, 80),
+            font=suggestion_font,
         )
 
+    canvas = np.array(image)[:, :, ::-1]
     return canvas
 
 
@@ -206,6 +248,8 @@ def main() -> None:
     predicted_character: Optional[str] = None
     confirmed_text: List[str] = []
     cooldown_frames = 0
+    active_label: Optional[str] = None
+    active_label_since: Optional[float] = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.namedWindow(TEXT_WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -251,32 +295,63 @@ def main() -> None:
 
                 stable_label = stabiliser.update(predicted_character, confidence)
 
+                if (
+                    predicted_character in DYNAMIC_GESTURE_LABELS
+                    and confidence >= MIN_CONFIDENCE
+                ):
+                    stable_label = predicted_character
+                    stabiliser.reset()
+
                 if cooldown_frames > 0:
                     cooldown_frames -= 1
                     if stable_label is not None:
                         stabiliser.reset()
+                        active_label = None
+                        active_label_since = None
                     stable_label = None
 
                 if stable_label is not None:
-                    normalized = normalise_label(stable_label)
+                    now = monotonic()
+                    if active_label != stable_label:
+                        active_label = stable_label
+                        active_label_since = now
 
-                    if stable_label == DELETE_CHARACTER_LABEL:
-                        if confirmed_text:
-                            confirmed_text.pop()
-                    elif stable_label == CLEAR_TEXT_LABEL:
-                        confirmed_text.clear()
-                    elif stable_label == ACCEPT_SUGGESTION_LABEL:
-                        composed = "".join(confirmed_text)
-                        suggestion = suggester.best_suggestion(composed)
-                        if suggestion:
-                            confirmed_text = list(
-                                suggester.apply_suggestion(composed, suggestion)
-                            )
-                    else:
-                        confirmed_text.append(normalized)
+                    hold_required = stable_label not in DYNAMIC_GESTURE_LABELS
+                    hold_satisfied = (
+                        not hold_required
+                        or (
+                            active_label_since is not None
+                            and (now - active_label_since) >= STATIC_HOLD_DURATION
+                        )
+                    )
 
-                    cooldown_frames = POST_CONFIRM_COOLDOWN
-                    stabiliser.reset()
+                    if hold_satisfied:
+                        normalized = normalise_label(stable_label)
+
+                        if stable_label == DELETE_CHARACTER_LABEL:
+                            if confirmed_text:
+                                confirmed_text.pop()
+                        elif stable_label == CLEAR_TEXT_LABEL:
+                            confirmed_text.clear()
+                        elif stable_label == ACCEPT_SUGGESTION_LABEL:
+                            composed = "".join(confirmed_text)
+                            suggestion = suggester.best_suggestion(composed)
+                            if suggestion:
+                                confirmed_text = list(
+                                    suggester.apply_suggestion(composed, suggestion)
+                                )
+                        elif stable_label == NO_OUTPUT_LABEL:
+                            pass
+                        else:
+                            confirmed_text.append(normalized)
+
+                        cooldown_frames = POST_CONFIRM_COOLDOWN
+                        stabiliser.reset()
+                        active_label = None
+                        active_label_since = None
+                else:
+                    active_label = None
+                    active_label_since = None
 
             composed_text = "".join(confirmed_text)
             suggestions = suggester.suggest(composed_text)
