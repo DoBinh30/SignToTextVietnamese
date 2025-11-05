@@ -285,6 +285,10 @@ def main() -> None:
         min_detection_confidence=args.confidence,
         min_tracking_confidence=0.5,
     ) as extractor:
+        hand_detected_recently = False
+        frames_since_hand = 0
+        hand_visible_frames = 0  # Đếm số frame tay đã ở trong khung
+
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
@@ -296,7 +300,11 @@ def main() -> None:
             result = extractor.extract(frame)
             sequence_builder.append(result.features if result else None)
 
+            # Kiểm tra có bàn tay trong khung
             if result and result.hand_landmarks:
+                frames_since_hand = 0
+                hand_visible_frames += 1
+                hand_detected_recently = True
                 mp_drawing.draw_landmarks(
                     frame,
                     result.hand_landmarks,
@@ -304,8 +312,14 @@ def main() -> None:
                     mp_styles.get_default_hand_landmarks_style(),
                     mp_styles.get_default_hand_connections_style(),
                 )
+            else:
+                frames_since_hand += 1
+                if frames_since_hand > 15:  # ~0.5 giây không thấy tay
+                    hand_detected_recently = False
+                    hand_visible_frames = 0  # reset khi mất tay
 
-            if sequence_builder.is_ready():
+            # Chỉ dự đoán khi có tay và tay đã ổn định ít nhất 10 frame (~0.3s)
+            if sequence_builder.is_ready() and hand_detected_recently and hand_visible_frames > 10:
                 features = sequence_builder.as_flattened().reshape(1, -1)
                 prediction = model.predict(features)
                 predicted_character = label_encoder.inverse_transform(prediction)[0]
@@ -315,15 +329,12 @@ def main() -> None:
                     try:
                         probabilities = model.predict_proba(features)
                         confidence = float(np.max(probabilities))
-                    except Exception:  # pragma: no cover - fallback to default
+                    except Exception:
                         confidence = 1.0
 
                 stable_label = stabiliser.update(predicted_character, confidence)
 
-                if (
-                    predicted_character in DYNAMIC_GESTURE_LABELS
-                    # and confidence >= MIN_CONFIDENCE
-                ):
+                if predicted_character in DYNAMIC_GESTURE_LABELS:
                     stable_label = predicted_character
                     reset_stabiliser()
 
@@ -394,9 +405,13 @@ def main() -> None:
                     active_label = None
                     active_label_since = None
 
+            else:
+                predicted_character = None
+
             composed_text = "".join(confirmed_text)
             suggestions = suggester.suggest(composed_text)
 
+            # Hiển thị chữ cái dự đoán tạm thời (nếu có)
             if predicted_character:
                 cv2.putText(
                     frame,
@@ -416,6 +431,7 @@ def main() -> None:
     cap.release()
     cv2.destroyAllWindows()
     text_display.close()
+
 
 
 if __name__ == "__main__":
