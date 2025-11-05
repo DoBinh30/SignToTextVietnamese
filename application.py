@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, deque
+from dataclasses import dataclass, field
+import json
 import pickle
 from pathlib import Path
 from time import monotonic
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Any, Deque, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
@@ -28,7 +30,7 @@ from sign_language import HandLandmarkExtractor, LandmarkSequenceBuilder
 from sign_language.vietnamese_suggester import VietnameseWordSuggester
 
 
-DEFAULT_MODEL_PATH = Path("model.p")
+DEFAULT_MODEL_PATH = Path("best_sequence_classifier.keras")
 WINDOW_NAME = "Sign Language Recognition"
 TEXT_WINDOW_NAME = "Văn bản nhận diện"
 
@@ -222,6 +224,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model file.",
     )
     parser.add_argument(
+        "--labels-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to class label metadata for sequence models. "
+            "If omitted the application will look for a sibling file next to the model."
+        ),
+    )
+    parser.add_argument(
         "--camera-index",
         type=int,
         default=0,
@@ -236,15 +247,123 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(path: Path):
-    with path.open("rb") as f:
-        model_dict = pickle.load(f)
-    if "model" not in model_dict or "label_encoder" not in model_dict:
-        raise ValueError("Model file does not contain required keys")
-    sequence_length = model_dict.get("sequence_length")
-    if sequence_length is None:
-        raise ValueError("Model file missing sequence_length metadata")
-    return model_dict["model"], model_dict["label_encoder"], sequence_length
+@dataclass
+class LegacyModelBundle:
+    model: Any
+    label_encoder: Any
+    sequence_length: int
+    kind: str = field(init=False, default="landmark")
+
+
+@dataclass
+class SequenceModelBundle:
+    model: Any
+    class_names: Sequence[str]
+    sequence_length: int
+    frame_shape: Tuple[int, int, int]
+    kind: str = field(init=False, default="sequence")
+
+
+def _load_label_metadata(
+    model_path: Path, labels_path: Optional[Path], num_classes: int
+) -> List[str]:
+    """Load ordered class names for sequence models."""
+
+    candidates: List[Path] = []
+    if labels_path is not None:
+        candidates.append(labels_path)
+    suffix = model_path.suffix
+    if suffix:
+        candidates.extend(
+            [
+                model_path.with_suffix(".labels.json"),
+                model_path.with_suffix(".labels.txt"),
+                model_path.with_suffix(".labels.npy"),
+                model_path.with_suffix(".labels.pkl"),
+                model_path.with_suffix(".labels.pickle"),
+            ]
+        )
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if candidate.suffix == ".json":
+            labels = json.loads(candidate.read_text(encoding="utf-8"))
+        elif candidate.suffix == ".txt":
+            labels = [line.strip() for line in candidate.read_text(encoding="utf-8").splitlines() if line.strip()]
+        elif candidate.suffix == ".npy":
+            import numpy as np  # Local import to avoid hard dependency.
+
+            labels = np.load(candidate, allow_pickle=True).tolist()
+        elif candidate.suffix in {".pkl", ".pickle"}:
+            with candidate.open("rb") as f:
+                metadata = pickle.load(f)
+            if hasattr(metadata, "classes_"):
+                labels = list(metadata.classes_)
+            elif isinstance(metadata, (list, tuple)):
+                labels = list(metadata)
+            else:
+                raise ValueError(
+                    f"Unsupported label metadata format in {candidate}."
+                )
+        else:
+            continue
+
+        if len(labels) != num_classes:
+            raise ValueError(
+                "Label metadata size does not match the model output dimension"
+            )
+        return [str(label) for label in labels]
+
+    raise FileNotFoundError(
+        "Unable to locate label metadata for the sequence model. "
+        "Provide the path via --labels-path or place a labels file next to the model."
+    )
+
+
+def load_model(path: Path, labels_path: Optional[Path] = None):
+    if path.suffix == ".p":
+        with path.open("rb") as f:
+            model_dict = pickle.load(f)
+        if "model" not in model_dict or "label_encoder" not in model_dict:
+            raise ValueError("Model file does not contain required keys")
+        sequence_length = model_dict.get("sequence_length")
+        if sequence_length is None:
+            raise ValueError("Model file missing sequence_length metadata")
+        return LegacyModelBundle(
+            model=model_dict["model"],
+            label_encoder=model_dict["label_encoder"],
+            sequence_length=sequence_length,
+        )
+
+    if path.suffix in {".keras", ".h5"}:
+        from tensorflow import keras  # Imported lazily to avoid startup cost.
+
+        model = keras.models.load_model(path)
+        input_shape = model.input_shape
+        if not isinstance(input_shape, tuple) or len(input_shape) != 5:
+            raise ValueError(
+                "Expected sequence model input shape (batch, time, height, width, channels)"
+            )
+        _, sequence_length, height, width, channels = input_shape
+        if None in (sequence_length, height, width, channels):
+            raise ValueError("Model input shape must be fully defined")
+        output_shape = model.output_shape
+        if not isinstance(output_shape, tuple):
+            raise ValueError("Unexpected model output shape")
+        num_classes = output_shape[-1]
+        if num_classes is None:
+            raise ValueError("Model output dimension must be defined")
+        class_names = _load_label_metadata(path, labels_path, num_classes)
+        frame_shape = (int(height), int(width), int(channels))
+        return SequenceModelBundle(
+            model=model,
+            class_names=class_names,
+            sequence_length=int(sequence_length),
+            frame_shape=frame_shape,
+        )
+
+    raise ValueError(f"Unsupported model format: {path.suffix}")
 
 
 def main() -> None:
@@ -252,8 +371,17 @@ def main() -> None:
     if not args.model_path.exists():
         raise FileNotFoundError(f"Model not found: {args.model_path}")
 
-    model, label_encoder, sequence_length = load_model(args.model_path)
-    sequence_builder = LandmarkSequenceBuilder(sequence_length=sequence_length)
+    model_bundle = load_model(args.model_path, args.labels_path)
+    sequence_builder: Optional[LandmarkSequenceBuilder] = None
+    frame_buffer: Optional[Deque[np.ndarray]] = None
+    if isinstance(model_bundle, LegacyModelBundle):
+        sequence_builder = LandmarkSequenceBuilder(
+            sequence_length=model_bundle.sequence_length
+        )
+    elif isinstance(model_bundle, SequenceModelBundle):
+        frame_buffer = deque(maxlen=model_bundle.sequence_length)
+    else:
+        raise RuntimeError("Unsupported model bundle returned by load_model")
     stabiliser = PredictionStabiliser(
         history_size=HISTORY_SIZE, min_consensus=MIN_CONSENSUS
     )
@@ -298,7 +426,27 @@ def main() -> None:
 
             frame = cv2.flip(frame, 1)
             result = extractor.extract(frame)
-            sequence_builder.append(result.features if result else None)
+
+            if isinstance(model_bundle, LegacyModelBundle):
+                assert sequence_builder is not None  # for type checkers
+                sequence_builder.append(result.features if result else None)
+            elif isinstance(model_bundle, SequenceModelBundle):
+                assert frame_buffer is not None
+                if result and result.hand_landmarks:
+                    height, width, channels = model_bundle.frame_shape
+                    resized = cv2.resize(frame, (width, height))
+                    if channels == 1:
+                        processed = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)[
+                            ..., np.newaxis
+                        ]
+                    elif channels == 3 and resized.ndim == 2:
+                        processed = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+                    else:
+                        processed = resized
+                    processed = processed.astype("float32") / 255.0
+                    frame_buffer.append(processed)
+                elif frame_buffer:
+                    frame_buffer.clear()
 
             # Kiểm tra có bàn tay trong khung
             if result and result.hand_landmarks:
@@ -317,96 +465,127 @@ def main() -> None:
                 if frames_since_hand > 15:  # ~0.5 giây không thấy tay
                     hand_detected_recently = False
                     hand_visible_frames = 0  # reset khi mất tay
+                    if frame_buffer is not None:
+                        frame_buffer.clear()
+
+            predicted_character = None
+            confidence = 0.0
+            stable_label: Optional[str] = None
 
             # Chỉ dự đoán khi có tay và tay đã ổn định ít nhất 10 frame (~0.3s)
-            if sequence_builder.is_ready() and hand_detected_recently and hand_visible_frames > 10:
-                features = sequence_builder.as_flattened().reshape(1, -1)
-                prediction = model.predict(features)
-                predicted_character = label_encoder.inverse_transform(prediction)[0]
+            if hand_detected_recently and hand_visible_frames > 10:
+                if isinstance(model_bundle, LegacyModelBundle):
+                    assert sequence_builder is not None
+                    if sequence_builder.is_ready():
+                        features = sequence_builder.as_flattened().reshape(1, -1)
+                        prediction = model_bundle.model.predict(features)
+                        predicted_character = model_bundle.label_encoder.inverse_transform(
+                            prediction
+                        )[0]
 
-                confidence = 1.0
-                if hasattr(model, "predict_proba"):
-                    try:
-                        probabilities = model.predict_proba(features)
-                        confidence = float(np.max(probabilities))
-                    except Exception:
                         confidence = 1.0
+                        if hasattr(model_bundle.model, "predict_proba"):
+                            try:
+                                probabilities = model_bundle.model.predict_proba(features)
+                                confidence = float(np.max(probabilities))
+                            except Exception:
+                                confidence = 1.0
 
-                stable_label = stabiliser.update(predicted_character, confidence)
-
-                if predicted_character in DYNAMIC_GESTURE_LABELS:
-                    stable_label = predicted_character
-                    reset_stabiliser()
-
-                cooldown_blocked = False
-                if cooldown_frames > 0:
-                    cooldown_frames -= 1
-                    if stable_label is not None:
-                        if stable_label in DYNAMIC_GESTURE_LABELS:
-                            cooldown_frames = 0
-                        else:
-                            reset_stabiliser()
-                            active_label = None
-                            active_label_since = None
-                            cooldown_blocked = True
-                    if cooldown_blocked:
-                        stable_label = None
-
-                if stable_label is not None:
-                    now = monotonic()
-                    if active_label != stable_label:
-                        active_label = stable_label
-                        active_label_since = now
-
-                    hold_required = stable_label not in DYNAMIC_GESTURE_LABELS
-                    hold_satisfied = (
-                        not hold_required
-                        or (
-                            active_label_since is not None
-                            and (now - active_label_since) >= STATIC_HOLD_DURATION
+                elif isinstance(model_bundle, SequenceModelBundle):
+                    assert frame_buffer is not None
+                    if len(frame_buffer) == frame_buffer.maxlen:
+                        sequence_array = np.asarray(frame_buffer, dtype=np.float32)
+                        sequence_array = sequence_array.reshape(
+                            1,
+                            model_bundle.sequence_length,
+                            *model_bundle.frame_shape,
                         )
-                    )
+                        probabilities = model_bundle.model.predict(
+                            sequence_array, verbose=0
+                        )[0]
+                        index = int(np.argmax(probabilities))
+                        confidence = float(probabilities[index])
+                        predicted_character = str(model_bundle.class_names[index])
 
-                    if hold_satisfied:
-                        should_commit = (
-                            stable_label != last_written_label
-                            or stable_label == NO_OUTPUT_LABEL
-                        )
+                if predicted_character is not None:
+                    stable_label = stabiliser.update(predicted_character, confidence)
 
-                        if should_commit:
-                            normalized = normalise_label(stable_label)
+                    if predicted_character in DYNAMIC_GESTURE_LABELS:
+                        stable_label = predicted_character
+                        reset_stabiliser()
 
-                            if stable_label == DELETE_CHARACTER_LABEL:
-                                if confirmed_text:
-                                    confirmed_text.pop()
-                            elif stable_label == CLEAR_TEXT_LABEL:
-                                confirmed_text.clear()
-                            elif stable_label == ACCEPT_SUGGESTION_LABEL:
-                                composed = "".join(confirmed_text)
-                                suggestion = suggester.best_suggestion(composed)
-                                if suggestion:
-                                    confirmed_text = list(
-                                        suggester.apply_suggestion(composed, suggestion)
-                                    )
-                            elif stable_label != NO_OUTPUT_LABEL:
-                                confirmed_text.append(normalized)
-
-                            last_written_label = stable_label
-
-                            if stable_label not in DYNAMIC_GESTURE_LABELS:
-                                cooldown_frames = POST_CONFIRM_COOLDOWN
-                            else:
+                    cooldown_blocked = False
+                    if cooldown_frames > 0:
+                        cooldown_frames -= 1
+                        if stable_label is not None:
+                            if stable_label in DYNAMIC_GESTURE_LABELS:
                                 cooldown_frames = 0
+                            else:
+                                reset_stabiliser()
+                                active_label = None
+                                active_label_since = None
+                                cooldown_blocked = True
+                        if cooldown_blocked:
+                            stable_label = None
 
-                            reset_stabiliser()
-                            active_label = None
-                            active_label_since = None
+                    if stable_label is not None:
+                        now = monotonic()
+                        if active_label != stable_label:
+                            active_label = stable_label
+                            active_label_since = now
+
+                        hold_required = stable_label not in DYNAMIC_GESTURE_LABELS
+                        hold_satisfied = (
+                            not hold_required
+                            or (
+                                active_label_since is not None
+                                and (now - active_label_since)
+                                >= STATIC_HOLD_DURATION
+                            )
+                        )
+
+                        if hold_satisfied:
+                            should_commit = (
+                                stable_label != last_written_label
+                                or stable_label == NO_OUTPUT_LABEL
+                            )
+
+                            if should_commit:
+                                normalized = normalise_label(stable_label)
+
+                                if stable_label == DELETE_CHARACTER_LABEL:
+                                    if confirmed_text:
+                                        confirmed_text.pop()
+                                elif stable_label == CLEAR_TEXT_LABEL:
+                                    confirmed_text.clear()
+                                elif stable_label == ACCEPT_SUGGESTION_LABEL:
+                                    composed = "".join(confirmed_text)
+                                    suggestion = suggester.best_suggestion(composed)
+                                    if suggestion:
+                                        confirmed_text = list(
+                                            suggester.apply_suggestion(
+                                                composed, suggestion
+                                            )
+                                        )
+                                elif stable_label != NO_OUTPUT_LABEL:
+                                    confirmed_text.append(normalized)
+
+                                last_written_label = stable_label
+
+                                if stable_label not in DYNAMIC_GESTURE_LABELS:
+                                    cooldown_frames = POST_CONFIRM_COOLDOWN
+                                else:
+                                    cooldown_frames = 0
+
+                                reset_stabiliser()
+                                active_label = None
+                                active_label_since = None
+                    else:
+                        active_label = None
+                        active_label_since = None
                 else:
                     active_label = None
                     active_label_since = None
-
-            else:
-                predicted_character = None
 
             composed_text = "".join(confirmed_text)
             suggestions = suggester.suggest(composed_text)
