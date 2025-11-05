@@ -10,6 +10,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import callbacks, layers, models, optimizers
+import cv2
+from glob import glob
+from sklearn.model_selection import train_test_split
+
 
 # Set global seeds for reproducibility
 SEED = 42
@@ -46,29 +50,64 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float | None = None
 
+def prepare_combined_dataset(config: DatasetConfig, base_dir: str = "data") -> Tuple[np.ndarray, ...]:
+    """Load both image (static) and video (sequence) data for sign language training."""
+    image_dir = os.path.join(base_dir, "images")
+    video_dir = os.path.join(base_dir, "videos")
 
-def prepare_synthetic_dataset(config: DatasetConfig) -> Tuple[np.ndarray, ...]:
-    """Create a reproducible synthetic dataset that mimics video sequences."""
+    sequences = []
+    labels = []
 
-    frames = np.random.rand(
-        config.num_samples,
-        config.sequence_length,
-        config.frame_height,
-        config.frame_width,
-        config.channels,
-    ).astype(np.float32)
+    label_names = sorted(os.listdir(video_dir))  # label folders shared by both sources
+    num_labels = len(label_names)
+    print(f"Detected {num_labels} classes: {label_names}")
 
-    labels = np.random.randint(0, config.num_classes, size=config.num_samples)
-    labels = tf.keras.utils.to_categorical(labels, num_classes=config.num_classes)
+    for label_index, label_name in enumerate(label_names):
+        # ---- Load videos ----
+        video_files = glob(os.path.join(video_dir, label_name, "*.mp4"))
+        for video_path in video_files:
+            cap = cv2.VideoCapture(video_path)
+            frames = []
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            step = max(total_frames // config.sequence_length, 1)
 
-    n_train = int(config.num_samples * 0.8)
-    n_val = int(config.num_samples * 0.1)
+            for i in range(0, total_frames, step):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.resize(frame, (config.frame_width, config.frame_height))
+                frame = frame.astype("float32") / 255.0
+                frames.append(frame)
+                if len(frames) == config.sequence_length:
+                    break
 
-    x_train, y_train = frames[:n_train], labels[:n_train]
-    x_val, y_val = frames[n_train : n_train + n_val], labels[n_train : n_train + n_val]
-    x_test, y_test = frames[n_train + n_val :], labels[n_train + n_val :]
+            cap.release()
+            if len(frames) == config.sequence_length:
+                sequences.append(frames)
+                labels.append(label_index)
 
-    return x_train, y_train, x_val, y_val, x_test, y_test
+        # ---- Load individual images (treated as static sequences) ----
+        image_files = glob(os.path.join(image_dir, label_name, "*.jpg"))
+        for image_path in image_files:
+            img = cv2.imread(image_path)
+            if img is None:
+                continue
+            img = cv2.resize(img, (config.frame_width, config.frame_height))
+            img = img.astype("float32") / 255.0
+            # replicate 1 image to match sequence length
+            frames = [img] * config.sequence_length
+            sequences.append(frames)
+            labels.append(label_index)
+
+    X = np.array(sequences, dtype=np.float32)
+    y = tf.keras.utils.to_categorical(labels, num_classes=config.num_classes)
+
+    # Split 80/10/10
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp.argmax(1))
+
+    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+    return X_train, y_train, X_val, y_val, X_test, y_test
 
 
 def build_sequence_model(config: DatasetConfig, training: TrainingConfig) -> models.Model:
@@ -83,7 +122,14 @@ def build_sequence_model(config: DatasetConfig, training: TrainingConfig) -> mod
     )
     base_cnn.trainable = True
 
-    x = layers.TimeDistributed(base_cnn, name="frame_feature_extractor")(frame_input)
+    data_augmentation = tf.keras.Sequential([
+        layers.RandomFlip("horizontal"),
+        layers.RandomRotation(0.1),
+        layers.RandomZoom(0.1),
+    ])
+    x = layers.TimeDistributed(data_augmentation)(frame_input)
+
+    x = layers.TimeDistributed(base_cnn, name="frame_feature_extractor")(x)
     x = layers.TimeDistributed(layers.GlobalAveragePooling2D(), name="feature_pooling")(x)
 
     x = layers.LSTM(256, return_sequences=False, name="temporal_modeling")(x)
@@ -141,7 +187,7 @@ def main() -> None:
     dataset_config = DatasetConfig()
     training_config = TrainingConfig()
 
-    x_train, y_train, x_val, y_val, x_test, y_test = prepare_synthetic_dataset(dataset_config)
+    x_train, y_train, x_val, y_val, x_test, y_test = prepare_combined_dataset(dataset_config)
 
     model = build_sequence_model(dataset_config, training_config)
     model.summary()
