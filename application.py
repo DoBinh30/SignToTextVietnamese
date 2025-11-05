@@ -48,19 +48,12 @@ STATIC_HOLD_DURATION = 0.1  # seconds
 DYNAMIC_GESTURE_LABELS = {"j", "z"}
 NO_OUTPUT_LABEL = "NO_OUTPUT"
 
-FUNCTIONAL_LABELS = {
-    DELETE_CHARACTER_LABEL,
-    CLEAR_TEXT_LABEL,
-    ACCEPT_SUGGESTION_LABEL,
-}
-
 # Prediction stabilisation parameters chosen to balance responsiveness and
 # robustness when handling rapid gesture sequences from video input.
 HISTORY_SIZE = 8
 MIN_CONSENSUS = 4
 MIN_CONFIDENCE = 0.6
-POST_CONFIRM_COOLDOWN = 5
-FUNCTIONAL_POST_CONFIRM_COOLDOWN = 2
+POST_CONFIRM_COOLDOWN = 3
 
 
 class TkinterTextDisplay:
@@ -261,10 +254,9 @@ def main() -> None:
 
     model, label_encoder, sequence_length = load_model(args.model_path)
     sequence_builder = LandmarkSequenceBuilder(sequence_length=sequence_length)
-    static_stabiliser = PredictionStabiliser(
+    stabiliser = PredictionStabiliser(
         history_size=HISTORY_SIZE, min_consensus=MIN_CONSENSUS
     )
-    fast_stabiliser = PredictionStabiliser(history_size=3, min_consensus=2)
     suggester = VietnameseWordSuggester.from_default()
 
     cap = cv2.VideoCapture(args.camera_index)
@@ -280,12 +272,8 @@ def main() -> None:
     active_label: Optional[str] = None
     active_label_since: Optional[float] = None
     last_written_label: Optional[str] = None
-    recent_labels: Deque[str] = deque(maxlen=3)
-
-    def reset_all_stabilisers() -> None:
-        static_stabiliser.reset()
-        fast_stabiliser.reset()
-        recent_labels.clear()
+    def reset_stabiliser() -> None:
+        stabiliser.reset()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
@@ -330,43 +318,23 @@ def main() -> None:
                     except Exception:  # pragma: no cover - fallback to default
                         confidence = 1.0
 
-                stable_label: Optional[str]
-                if predicted_character in FUNCTIONAL_LABELS:
-                    stable_label = fast_stabiliser.update(
-                        predicted_character, confidence
-                    )
-                else:
-                    stable_label = static_stabiliser.update(
-                        predicted_character, confidence
-                    )
-
-                if predicted_character:
-                    recent_labels.append(predicted_character)
-                    if (
-                        predicted_character == DELETE_CHARACTER_LABEL
-                        and recent_labels.count(DELETE_CHARACTER_LABEL) >= 2
-                    ):
-                        stable_label = DELETE_CHARACTER_LABEL
-                        fast_stabiliser.reset()
+                stable_label = stabiliser.update(predicted_character, confidence)
 
                 if (
                     predicted_character in DYNAMIC_GESTURE_LABELS
                     # and confidence >= MIN_CONFIDENCE
                 ):
                     stable_label = predicted_character
-                    reset_all_stabilisers()
+                    reset_stabiliser()
 
                 cooldown_blocked = False
                 if cooldown_frames > 0:
                     cooldown_frames -= 1
                     if stable_label is not None:
-                        if (
-                            stable_label in DYNAMIC_GESTURE_LABELS
-                            or stable_label in FUNCTIONAL_LABELS
-                        ):
+                        if stable_label in DYNAMIC_GESTURE_LABELS:
                             cooldown_frames = 0
                         else:
-                            reset_all_stabilisers()
+                            reset_stabiliser()
                             active_label = None
                             active_label_since = None
                             cooldown_blocked = True
@@ -389,13 +357,10 @@ def main() -> None:
                     )
 
                     if hold_satisfied:
-                        should_commit = True
-                        if stable_label not in {
-                            DELETE_CHARACTER_LABEL,
-                            CLEAR_TEXT_LABEL,
-                            ACCEPT_SUGGESTION_LABEL,
-                        } and stable_label == last_written_label:
-                            should_commit = False
+                        should_commit = (
+                            stable_label != last_written_label
+                            or stable_label == NO_OUTPUT_LABEL
+                        )
 
                         if should_commit:
                             normalized = normalise_label(stable_label)
@@ -403,10 +368,8 @@ def main() -> None:
                             if stable_label == DELETE_CHARACTER_LABEL:
                                 if confirmed_text:
                                     confirmed_text.pop()
-                                last_written_label = None
                             elif stable_label == CLEAR_TEXT_LABEL:
                                 confirmed_text.clear()
-                                last_written_label = None
                             elif stable_label == ACCEPT_SUGGESTION_LABEL:
                                 composed = "".join(confirmed_text)
                                 suggestion = suggester.best_suggestion(composed)
@@ -414,21 +377,17 @@ def main() -> None:
                                     confirmed_text = list(
                                         suggester.apply_suggestion(composed, suggestion)
                                     )
-                                last_written_label = None
-                            elif stable_label == NO_OUTPUT_LABEL:
-                                last_written_label = NO_OUTPUT_LABEL
-                            else:
+                            elif stable_label != NO_OUTPUT_LABEL:
                                 confirmed_text.append(normalized)
-                                last_written_label = stable_label
 
-                            if stable_label in FUNCTIONAL_LABELS:
-                                cooldown_frames = FUNCTIONAL_POST_CONFIRM_COOLDOWN
-                            elif stable_label not in DYNAMIC_GESTURE_LABELS:
+                            last_written_label = stable_label
+
+                            if stable_label not in DYNAMIC_GESTURE_LABELS:
                                 cooldown_frames = POST_CONFIRM_COOLDOWN
                             else:
                                 cooldown_frames = 0
 
-                            reset_all_stabilisers()
+                            reset_stabiliser()
                             active_label = None
                             active_label_since = None
                 else:
