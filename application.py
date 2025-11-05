@@ -385,10 +385,13 @@ def main() -> None:
                                 confirmed_text.append(normalized)
                                 last_written_label = stable_label
 
-                            if stable_label not in DYNAMIC_GESTURE_LABELS:
+                            if stable_label not in DYNAMIC_GESTURE_LABELS and stable_label not in {
+                                DELETE_CHARACTER_LABEL, CLEAR_TEXT_LABEL, ACCEPT_SUGGESTION_LABEL
+                            }:
                                 cooldown_frames = POST_CONFIRM_COOLDOWN
                             else:
                                 cooldown_frames = 0
+
                             stabiliser.reset()
                             active_label = None
                             active_label_since = None
