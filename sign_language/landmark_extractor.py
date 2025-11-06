@@ -46,6 +46,11 @@ class LandmarkSequenceBuilder:
         if len(self._buffer) > self.sequence_length:
             self._buffer.pop(0)
 
+    def reset(self) -> None:
+        """Clear all buffered landmarks."""
+
+        self._buffer.clear()
+
     def is_ready(self) -> bool:
         """Return ``True`` when the buffer is full."""
 

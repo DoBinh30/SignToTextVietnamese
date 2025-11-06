@@ -16,10 +16,9 @@ from collections import Counter, deque
 import pickle
 from pathlib import Path
 from time import monotonic
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Any, Deque, List, Optional, Sequence, Tuple
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import tensorflow as tf
 import tkinter as tk
@@ -57,7 +56,12 @@ SPECIAL_CHARACTERS = {"^", "aw", "dd", "ow", "uw"}
 # robustness when handling rapid gesture sequences from video input.
 HISTORY_SIZE = 8
 MIN_CONSENSUS = 4
-MIN_CONFIDENCE = 0.6
+DYNAMIC_MIN_CONFIDENCE = 0.75
+MIN_CONFIDENCE = 0.65
+STATIC_MIN_CONFIDENCE_GAP = 0.15
+DYNAMIC_MIN_CONFIDENCE_GAP = 0.2
+HAND_STABLE_FRAME_COUNT = 12
+HAND_ABSENCE_TIMEOUT_FRAMES = 15
 POST_CONFIRM_COOLDOWN = 3
 
 
@@ -198,6 +202,9 @@ class PredictionStabiliser:
             self.reset()
             return None
 
+        if confidence < self._min_confidence:
+            return None
+
         self._history.append((label, confidence))
         if len(self._history) < self._min_consensus:
             return None
@@ -212,6 +219,37 @@ class PredictionStabiliser:
         if count < self._min_consensus:
             return None
         return candidate
+
+
+def draw_hand_highlight(
+    frame: np.ndarray,
+    hand_landmarks: Any,
+    *,
+    color: Tuple[int, int, int] = (0, 200, 0),
+    thickness: int = 2,
+    padding: float = 0.12,
+) -> None:
+    """Draw a thin square highlight surrounding the detected hand."""
+
+    height, width = frame.shape[:2]
+    xs = [lm.x for lm in hand_landmarks.landmark]
+    ys = [lm.y for lm in hand_landmarks.landmark]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    cx = (min_x + max_x) * 0.5 * width
+    cy = (min_y + max_y) * 0.5 * height
+    box_w = (max_x - min_x) * width
+    box_h = (max_y - min_y) * height
+    side = max(box_w, box_h) * (1.0 + padding)
+    half = side / 2.0
+
+    left = int(max(cx - half, 0))
+    right = int(min(cx + half, width - 1))
+    top = int(max(cy - half, 0))
+    bottom = int(min(cy + half, height - 1))
+
+    cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
 
 
 def normalise_label(label: str) -> str:
@@ -454,10 +492,6 @@ def main() -> None:
     if not cap.isOpened():
         raise RuntimeError("Unable to open camera")
 
-    mp_drawing = mp.solutions.drawing_utils
-    mp_styles = mp.solutions.drawing_styles
-
-    predicted_character: Optional[str] = None
     confirmed_text: List[str] = []
     cooldown_frames = 0
     active_label: Optional[str] = None
@@ -477,7 +511,7 @@ def main() -> None:
         min_tracking_confidence=0.5,
     ) as extractor:
         hand_detected_recently = False
-        frames_since_hand = 0
+        frames_since_hand = HAND_ABSENCE_TIMEOUT_FRAMES + 1
         hand_visible_frames = 0  # Đếm số frame tay đã ở trong khung
 
         while True:
@@ -489,42 +523,68 @@ def main() -> None:
 
             frame = cv2.flip(frame, 1)
             result = extractor.extract(frame)
-            sequence_builder.append(result.features if result else None)
+            has_hand = result is not None and result.hand_landmarks is not None
+            sequence_builder.append(result.features if has_hand else None)
 
-            # Kiểm tra có bàn tay trong khung
-            if result and result.hand_landmarks:
+            if has_hand:
                 frames_since_hand = 0
                 hand_visible_frames += 1
                 hand_detected_recently = True
-                mp_drawing.draw_landmarks(
-                    frame,
-                    result.hand_landmarks,
-                    mp.solutions.hands.HAND_CONNECTIONS,
-                    mp_styles.get_default_hand_landmarks_style(),
-                    mp_styles.get_default_hand_connections_style(),
-                )
+                draw_hand_highlight(frame, result.hand_landmarks)
             else:
                 frames_since_hand += 1
-                if frames_since_hand > 15:  # ~0.5 giây không thấy tay
+                hand_visible_frames = 0
+                if frames_since_hand > HAND_ABSENCE_TIMEOUT_FRAMES:
+                    if hand_detected_recently:
+                        reset_stabiliser()
+                        sequence_builder.reset()
                     hand_detected_recently = False
-                    hand_visible_frames = 0  # reset khi mất tay
+                    active_label = None
+                    active_label_since = None
+                    last_written_label = None
 
-            # Chỉ dự đoán khi có tay và tay đã ổn định ít nhất 10 frame (~0.3s)
-            if sequence_builder.is_ready() and hand_detected_recently and hand_visible_frames > 10:
+            should_attempt_prediction = (
+                has_hand
+                and hand_detected_recently
+                and hand_visible_frames >= HAND_STABLE_FRAME_COUNT
+                and sequence_builder.is_ready()
+            )
+
+            if should_attempt_prediction:
                 flat_sequence = sequence_builder.as_flattened()
                 feature_tensor = flat_sequence.reshape(sequence_length, -1)
                 feature_tensor = np.expand_dims(feature_tensor, axis=0)
                 probabilities = model.predict(feature_tensor, verbose=0)[0]
-                predicted_index = int(np.argmax(probabilities))
-                predicted_character = label_encoder.inverse_transform([predicted_index])[0]
+                sorted_indices = np.argsort(probabilities)[::-1]
+                top_index = int(sorted_indices[0])
+                confidence = float(probabilities[top_index])
+                second_confidence = (
+                    float(probabilities[sorted_indices[1]])
+                    if len(sorted_indices) > 1
+                    else 0.0
+                )
+                confidence_gap = confidence - second_confidence
+                predicted_character = label_encoder.inverse_transform([top_index])[0]
 
-                confidence = float(np.max(probabilities))
+                is_dynamic_like = predicted_character in DYNAMIC_LIKE
+                min_confidence = (
+                    DYNAMIC_MIN_CONFIDENCE if is_dynamic_like else MIN_CONFIDENCE
+                )
+                min_gap = (
+                    DYNAMIC_MIN_CONFIDENCE_GAP
+                    if is_dynamic_like
+                    else STATIC_MIN_CONFIDENCE_GAP
+                )
 
-                stable_label = stabiliser.update(predicted_character, confidence)
-
-                if predicted_character in DYNAMIC_LIKE:
-                    stable_label = predicted_character
-                    reset_stabiliser()
+                stable_label: Optional[str]
+                if confidence >= min_confidence and confidence_gap >= min_gap:
+                    if is_dynamic_like:
+                        stable_label = predicted_character
+                        reset_stabiliser()
+                    else:
+                        stable_label = stabiliser.update(predicted_character, confidence)
+                else:
+                    stable_label = None
 
                 cooldown_blocked = False
                 if cooldown_frames > 0:
@@ -604,23 +664,8 @@ def main() -> None:
                     active_label = None
                     active_label_since = None
 
-            else:
-                predicted_character = None
-
             composed_text = "".join(confirmed_text)
             suggestions = suggester.suggest(composed_text)
-
-            # Hiển thị chữ cái dự đoán tạm thời (nếu có)
-            if predicted_character:
-                cv2.putText(
-                    frame,
-                    predicted_character,
-                    (50, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    3,
-                    (0, 0, 0),
-                    6,
-                )
 
             cv2.imshow(WINDOW_NAME, frame)
             text_display.update(composed_text, suggestions)
