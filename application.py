@@ -21,6 +21,7 @@ from typing import Deque, List, Optional, Sequence, Tuple
 import cv2
 import mediapipe as mp
 import numpy as np
+import tensorflow as tf
 import tkinter as tk
 from tkinter import font as tkfont
 
@@ -45,7 +46,7 @@ CHARACTER_OVERRIDES = {"SPACE": " "}
 # Gesture handling parameters tuned to reduce accidental activations while keeping
 # dynamic gestures responsive.
 STATIC_HOLD_DURATION = 0.1  # seconds
-DYNAMIC_GESTURE_LABELS = {"j", "z"}
+DYNAMIC_GESTURE_LABELS = {"j", "z"} #, "q", "w", "SAC", "HUYEN", "HOI", "NGA"
 NO_OUTPUT_LABEL = "NO_OUTPUT"
 
 # Prediction stabilisation parameters chosen to balance responsiveness and
@@ -239,12 +240,23 @@ def parse_args() -> argparse.Namespace:
 def load_model(path: Path):
     with path.open("rb") as f:
         model_dict = pickle.load(f)
-    if "model" not in model_dict or "label_encoder" not in model_dict:
+    if "label_encoder" not in model_dict:
         raise ValueError("Model file does not contain required keys")
     sequence_length = model_dict.get("sequence_length")
     if sequence_length is None:
         raise ValueError("Model file missing sequence_length metadata")
-    return model_dict["model"], model_dict["label_encoder"], sequence_length
+    model_config = model_dict.get("model_config")
+    model_weights = model_dict.get("model_weights")
+    if model_config is None or model_weights is None:
+        raise ValueError("Model file missing neural network parameters")
+    model = tf.keras.models.model_from_json(model_config)
+    model.set_weights(model_weights)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=["accuracy"],
+    )
+    return model, model_dict["label_encoder"], sequence_length
 
 
 def main() -> None:
@@ -320,17 +332,14 @@ def main() -> None:
 
             # Chỉ dự đoán khi có tay và tay đã ổn định ít nhất 10 frame (~0.3s)
             if sequence_builder.is_ready() and hand_detected_recently and hand_visible_frames > 10:
-                features = sequence_builder.as_flattened().reshape(1, -1)
-                prediction = model.predict(features)
-                predicted_character = label_encoder.inverse_transform(prediction)[0]
+                flat_sequence = sequence_builder.as_flattened()
+                feature_tensor = flat_sequence.reshape(sequence_length, -1)
+                feature_tensor = np.expand_dims(feature_tensor, axis=0)
+                probabilities = model.predict(feature_tensor, verbose=0)[0]
+                predicted_index = int(np.argmax(probabilities))
+                predicted_character = label_encoder.inverse_transform([predicted_index])[0]
 
-                confidence = 1.0
-                if hasattr(model, "predict_proba"):
-                    try:
-                        probabilities = model.predict_proba(features)
-                        confidence = float(np.max(probabilities))
-                    except Exception:
-                        confidence = 1.0
+                confidence = float(np.max(probabilities))
 
                 stable_label = stabiliser.update(predicted_character, confidence)
 
