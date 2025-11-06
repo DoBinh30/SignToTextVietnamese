@@ -46,8 +46,12 @@ CHARACTER_OVERRIDES = {"SPACE": " "}
 # Gesture handling parameters tuned to reduce accidental activations while keeping
 # dynamic gestures responsive.
 STATIC_HOLD_DURATION = 0.1  # seconds
-DYNAMIC_GESTURE_LABELS = {"j", "z"}
+DYNAMIC_GESTURE_LABELS = {"j", "z", "q", "w"}
 NO_OUTPUT_LABEL = "NO_OUTPUT"
+
+PUNCTUATION_DYNAMIC = {"SAC", "HUYEN", "HOI", "NGA"}
+PUNCTUATION_STATIC = {"NANG"}
+SPECIAL_CHARACTERS = {"^", "aw", "dd", "ow", "uw"}
 
 # Prediction stabilisation parameters chosen to balance responsiveness and
 # robustness when handling rapid gesture sequences from video input.
@@ -258,6 +262,181 @@ def load_model(path: Path):
     )
     return model, model_dict["label_encoder"], sequence_length
 
+# ===== Vietnamese IME helpers (Telex + Tone) =====
+
+# Bảng nguyên âm cơ sở có/không mũ/dấu
+_VOWEL_TONE_TABLE_LOWER = {
+    "a": {"NONE":"a","SAC":"á","HUYEN":"à","HOI":"ả","NGA":"ã","NANG":"ạ"},
+    "ă": {"NONE":"ă","SAC":"ắ","HUYEN":"ằ","HOI":"ẳ","NGA":"ẵ","NANG":"ặ"},
+    "â": {"NONE":"â","SAC":"ấ","HUYEN":"ầ","HOI":"ẩ","NGA":"ẫ","NANG":"ậ"},
+    "e": {"NONE":"e","SAC":"é","HUYEN":"è","HOI":"ẻ","NGA":"ẽ","NANG":"ẹ"},
+    "ê": {"NONE":"ê","SAC":"ế","HUYEN":"ề","HOI":"ể","NGA":"ễ","NANG":"ệ"},
+    "i": {"NONE":"i","SAC":"í","HUYEN":"ì","HOI":"ỉ","NGA":"ĩ","NANG":"ị"},
+    "o": {"NONE":"o","SAC":"ó","HUYEN":"ò","HOI":"ỏ","NGA":"õ","NANG":"ọ"},
+    "ô": {"NONE":"ô","SAC":"ố","HUYEN":"ồ","HOI":"ổ","NGA":"ỗ","NANG":"ộ"},
+    "ơ": {"NONE":"ơ","SAC":"ớ","HUYEN":"ờ","HOI":"ở","NGA":"ỡ","NANG":"ợ"},
+    "u": {"NONE":"u","SAC":"ú","HUYEN":"ù","HOI":"ủ","NGA":"ũ","NANG":"ụ"},
+    "ư": {"NONE":"ư","SAC":"ứ","HUYEN":"ừ","HOI":"ử","NGA":"ữ","NANG":"ự"},
+    "y": {"NONE":"y","SAC":"ý","HUYEN":"ỳ","HOI":"ỷ","NGA":"ỹ","NANG":"ỵ"},
+}
+_VOWEL_TONE_TABLE_UPPER = {
+    "A": {"NONE":"A","SAC":"Á","HUYEN":"À","HOI":"Ả","NGA":"Ã","NANG":"Ạ"},
+    "Ă": {"NONE":"Ă","SAC":"Ắ","HUYEN":"Ằ","HOI":"Ẳ","NGA":"Ẵ","NANG":"Ặ"},
+    "Â": {"NONE":"Â","SAC":"Ấ","HUYEN":"Ầ","HOI":"Ẩ","NGA":"Ẫ","NANG":"Ậ"},
+    "E": {"NONE":"E","SAC":"É","HUYEN":"È","HOI":"Ẻ","NGA":"Ẽ","NANG":"Ẹ"},
+    "Ê": {"NONE":"Ê","SAC":"Ế","HUYEN":"Ề","HOI":"Ể","NGA":"Ễ","NANG":"Ệ"},
+    "I": {"NONE":"I","SAC":"Í","HUYEN":"Ì","HOI":"Ỉ","NGA":"Ĩ","NANG":"Ị"},
+    "O": {"NONE":"O","SAC":"Ó","HUYEN":"Ò","HOI":"Ỏ","NGA":"Õ","NANG":"Ọ"},
+    "Ô": {"NONE":"Ô","SAC":"Ố","HUYEN":"Ồ","HOI":"Ổ","NGA":"Ỗ","NANG":"Ộ"},
+    "Ơ": {"NONE":"Ơ","SAC":"Ớ","HUYEN":"Ờ","HOI":"Ở","NGA":"Ỡ","NANG":"Ợ"},
+    "U": {"NONE":"U","SAC":"Ú","HUYEN":"Ù","HOI":"Ủ","NGA":"Ũ","NANG":"Ụ"},
+    "Ư": {"NONE":"Ư","SAC":"Ứ","HUYEN":"Ừ","HOI":"Ử","NGA":"Ữ","NANG":"Ự"},
+    "Y": {"NONE":"Y","SAC":"Ý","HUYEN":"Ỳ","HOI":"Ỷ","NGA":"Ỹ","NANG":"Ỵ"},
+}
+
+# Map ngược: ký tự có dấu -> (base_vowel, current_tone)
+_INV_MAP = {}
+for base, tones in {**_VOWEL_TONE_TABLE_LOWER, **_VOWEL_TONE_TABLE_UPPER}.items():
+    for tone, ch in tones.items():
+        _INV_MAP[ch] = (base, tone)
+
+# Biến đổi ^ / aw / ow / uw / dd
+_CIRC = {"a":"â","A":"Â","e":"ê","E":"Ê","o":"ô","O":"Ô"}
+_BREVE = {"a":"ă","A":"Ă"}
+_HORN  = {"o":"ơ","O":"Ơ","u":"ư","U":"Ư"}
+
+def _last_word_bounds(chars: List[str]) -> tuple[int,int]:
+    s = "".join(chars)
+    if not s:
+        return (0,0)
+    i = len(s)-1
+    while i>=0 and not s[i].isalpha():
+        i -= 1
+    if i<0: return (len(s), len(s))
+    end = i+1
+    while i>=0 and s[i].isalpha():
+        i -= 1
+    start = i+1
+    return (start, end)
+
+# Ưu tiên chọn nguyên âm để đặt dấu (gần với quy tắc gõ tiếng Việt phổ biến)
+_VOWEL_PRIORITY = ["a","ă","â","e","ê","o","ô","ơ","u","ư","i","y",
+                   "A","Ă","Â","E","Ê","O","Ô","Ơ","U","Ư","I","Y"]
+
+def _apply_tone_to_char(ch: str, tone: str) -> str:
+    # Nếu không phải nguyên âm có trong bảng -> giữ nguyên
+    if ch not in _INV_MAP:
+        # Có thể là nguyên âm không dấu (a/e/i/o/u/y...), map về base và tone NONE trước
+        base = None
+        if ch.lower() in ["a","e","i","o","u","y"]:
+            # Chọn base có/không mũ/phụ thuộc vào chính ký tự
+            base = ch
+            # chuyển base về đúng bảng
+            if ch in _VOWEL_TONE_TABLE_LOWER:
+                return _VOWEL_TONE_TABLE_LOWER[ch][tone if tone!="NONE" else "NONE"]
+            if ch in _VOWEL_TONE_TABLE_UPPER:
+                return _VOWEL_TONE_TABLE_UPPER[ch][tone if tone!="NONE" else "NONE"]
+            # nếu là a/e/i/o/u/y thường
+            if ch.islower():
+                return _VOWEL_TONE_TABLE_LOWER[ch][tone if tone!="NONE" else "NONE"]
+            else:
+                return _VOWEL_TONE_TABLE_UPPER[ch][tone if tone!="NONE" else "NONE"]
+        return ch
+
+    base, _old = _INV_MAP[ch]
+    table = _VOWEL_TONE_TABLE_UPPER if base.isupper() else _VOWEL_TONE_TABLE_LOWER
+    return table[base][tone if tone!="NONE" else "NONE"]
+
+def _choose_vowel_index(word: str) -> int:
+    # Trả về index trong word để đặt dấu; nếu không tìm được trả về -1
+    idxs = [i for i,ch in enumerate(word) if ch in _INV_MAP or ch.lower() in ["a","e","i","o","u","y"] or ch in ["ă","â","ê","ô","ơ","ư","Ă","Â","Ê","Ô","Ơ","Ư"]]
+    if not idxs:
+        return -1
+    # Ưu tiên theo bảng _VOWEL_PRIORITY
+    best = None
+    best_rank = 10**9
+    for i in idxs:
+        ch = word[i]
+        # chuyển về base nếu đang là ký tự có dấu
+        base = _INV_MAP[ch][0] if ch in _INV_MAP else ch
+        # nếu là nguyên âm ASCII thường mà bảng không có (e.g. 'a'), map vào bảng lower/upper tương ứng
+        if base not in _VOWEL_TONE_TABLE_LOWER and base not in _VOWEL_TONE_TABLE_UPPER:
+            # chuyển 'a'..'y' bình thường sang đúng key
+            if base.islower() and base in _VOWEL_TONE_TABLE_LOWER:
+                pass
+            elif base.isupper() and base in _VOWEL_TONE_TABLE_UPPER:
+                pass
+        rank = _VOWEL_PRIORITY.index(base) if base in _VOWEL_PRIORITY else 10**6
+        if rank < best_rank:
+            best_rank = rank
+            best = i
+    return best if best is not None else -1
+
+def apply_punctuation(confirmed: List[str], tone: str) -> List[str]:
+    """Áp dấu thanh vào nguyên âm mục tiêu của từ cuối; có thể đổi nhiều lần."""
+    if not confirmed:
+        return confirmed
+    s = "".join(confirmed)
+    L, R = _last_word_bounds(confirmed)
+    if L == R:
+        return confirmed
+    word = s[L:R]
+    i = _choose_vowel_index(word)
+    if i < 0:
+        return confirmed
+    # thay nguyên âm ở vị trí i
+    chars = list(s)
+    chars[L+i] = _apply_tone_to_char(chars[L+i], tone)
+    return chars
+
+def apply_special_character(confirmed: List[str], token: str) -> List[str]:
+    """Xử lý ^, aw, dd, ow, uw lên ký tự/cuối từ cuối."""
+    s = "".join(confirmed)
+    L, R = _last_word_bounds(confirmed)
+    if token == "dd":
+        # nếu ký tự cuối là d/D -> thay thành đ/Đ; nếu không, chèn 'đ'
+        if confirmed and confirmed[-1] in ("d","D"):
+            confirmed[-1] = "đ" if confirmed[-1]=="d" else "Đ"
+        else:
+            confirmed.append("đ")
+        return confirmed
+
+    if L == R:
+        return confirmed
+    word = list(s[L:R])
+
+    # chọn vị trí nguyên âm mục tiêu gần nhất phía cuối
+    # với ^: chỉ a/e/o; aw: chỉ a; ow: chỉ o; uw: chỉ u
+    def _find_last(of_set: set[str]) -> int:
+        for j in range(len(word)-1, -1, -1):
+            if word[j] in of_set:
+                return j
+        return -1
+
+    if token == "^":
+        idx = _find_last(set(["a","A","e","E","o","O"]))
+        if idx >= 0:
+            ch = word[idx]
+            if ch in _CIRC:
+                word[idx] = _CIRC[ch]
+    elif token == "aw":
+        idx = _find_last(set(["a","A"]))
+        if idx >= 0:
+            word[idx] = _BREVE.get(word[idx], word[idx])
+    elif token == "ow":
+        idx = _find_last(set(["o","O"]))
+        if idx >= 0:
+            word[idx] = _HORN.get(word[idx], word[idx])
+    elif token == "uw":
+        idx = _find_last(set(["u","U"]))
+        if idx >= 0:
+            word[idx] = _HORN.get(word[idx], word[idx])
+
+    # ghép lại vào confirmed
+    new_s = "".join(s[:L] + "".join(word) + s[R:])
+    return list(new_s)
+
+DYNAMIC_LIKE = DYNAMIC_GESTURE_LABELS | PUNCTUATION_DYNAMIC
 
 def main() -> None:
     args = parse_args()
@@ -343,7 +522,7 @@ def main() -> None:
 
                 stable_label = stabiliser.update(predicted_character, confidence)
 
-                if predicted_character in DYNAMIC_GESTURE_LABELS:
+                if predicted_character in DYNAMIC_LIKE:
                     stable_label = predicted_character
                     reset_stabiliser()
 
@@ -398,11 +577,22 @@ def main() -> None:
                                         suggester.apply_suggestion(composed, suggestion)
                                     )
                             elif stable_label != NO_OUTPUT_LABEL:
-                                confirmed_text.append(normalized)
+                                # 1) SPECIAL_CHARACTERS (telex hình thái)
+                                if stable_label in SPECIAL_CHARACTERS:
+                                    confirmed_text[:] = apply_special_character(confirmed_text, stable_label)
+
+                                # 2) PUNCTUATION (dấu thanh)
+                                elif stable_label in PUNCTUATION_DYNAMIC or stable_label in PUNCTUATION_STATIC:
+                                    # Cho phép đổi dấu nhiều lần: áp thẳng tone mới vào nguyên âm mục tiêu
+                                    confirmed_text[:] = apply_punctuation(confirmed_text, stable_label)
+
+                                # 3) Ký tự alphabet/bình thường -> thêm mới
+                                else:
+                                    confirmed_text.append(normalized)
 
                             last_written_label = stable_label
 
-                            if stable_label not in DYNAMIC_GESTURE_LABELS:
+                            if stable_label not in DYNAMIC_LIKE:
                                 cooldown_frames = POST_CONFIRM_COOLDOWN
                             else:
                                 cooldown_frames = 0
