@@ -488,7 +488,7 @@ def main() -> None:
     )
     suggester = VietnameseWordSuggester.from_default()
 
-    cap = cv2.VideoCapture(args.camera_index)
+    cap = cv2.VideoCapture("TestVid.mp4")
     if not cap.isOpened():
         raise RuntimeError("Unable to open camera")
 
