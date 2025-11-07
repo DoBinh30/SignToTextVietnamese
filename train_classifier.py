@@ -63,17 +63,25 @@ def augment_landmarks(sequence: np.ndarray) -> np.ndarray:
 
 
 def build_model(sequence_length: int, num_classes: int, learning_rate: float) -> tf.keras.Model:
+    """Build a hybrid CNN-LSTM classifier for spatio-temporal landmarks."""
+
     model = tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=(sequence_length, 42)),
-            tf.keras.layers.Conv1D(64, kernel_size=3, padding="same", activation="relu"),
+            # Convolutional feature extractor (per-frame spatial cues)
+            tf.keras.layers.Conv1D(128, kernel_size=3, padding="same"),
             tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.Conv1D(128, kernel_size=3, padding="same", activation="relu"),
+            tf.keras.layers.Activation("relu"),
+            tf.keras.layers.Conv1D(256, kernel_size=3, padding="same"),
             tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.Activation("relu"),
             tf.keras.layers.MaxPooling1D(pool_size=2),
-            tf.keras.layers.Conv1D(256, kernel_size=3, padding="same", activation="relu"),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.GlobalAveragePooling1D(),
+            tf.keras.layers.Dropout(0.25),
+            # Temporal modelling with stacked LSTM layers
+            tf.keras.layers.LSTM(256, return_sequences=True),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.LSTM(128),
+            tf.keras.layers.Dropout(0.3),
             tf.keras.layers.Dense(128, activation="relu"),
             tf.keras.layers.Dropout(0.3),
             tf.keras.layers.Dense(num_classes, activation="softmax"),
