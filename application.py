@@ -56,7 +56,7 @@ SPECIAL_CHARACTERS = {"^", "aw", "dd", "ow", "uw"}
 # robustness when handling rapid gesture sequences from video input.
 HISTORY_SIZE = 8
 MIN_CONSENSUS = 4
-DYNAMIC_MIN_CONFIDENCE = 0.75
+DYNAMIC_MIN_CONFIDENCE = 0.8
 MIN_CONFIDENCE = 0.75
 STATIC_MIN_CONFIDENCE_GAP = 0.15
 DYNAMIC_MIN_CONFIDENCE_GAP = 0.2
@@ -488,7 +488,7 @@ def main() -> None:
     )
     suggester = VietnameseWordSuggester.from_default()
 
-    cap = cv2.VideoCapture("TestVid.mp4")
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Unable to open camera")
 
