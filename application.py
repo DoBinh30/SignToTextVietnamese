@@ -482,6 +482,7 @@ def main() -> None:
         raise FileNotFoundError(f"Model not found: {args.model_path}")
 
     model, label_encoder, sequence_length = load_model(args.model_path)
+    index_to_label = list(label_encoder.classes_)
     sequence_builder = LandmarkSequenceBuilder(sequence_length=sequence_length)
     stabiliser = PredictionStabiliser(
         history_size=HISTORY_SIZE, min_consensus=MIN_CONSENSUS
@@ -503,6 +504,10 @@ def main() -> None:
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     text_display = TkinterTextDisplay()
+
+    cached_text: Optional[str] = None
+    cached_suggestions: Tuple[str, ...] = ()
+    last_display_payload: Tuple[Optional[str], Tuple[str, ...]] = (None, ())
 
     with HandLandmarkExtractor(
         static_image_mode=False,
@@ -555,16 +560,24 @@ def main() -> None:
                 feature_tensor = flat_sequence.reshape(sequence_length, -1)
                 feature_tensor = np.expand_dims(feature_tensor, axis=0)
                 probabilities = model.predict(feature_tensor, verbose=0)[0]
-                sorted_indices = np.argsort(probabilities)[::-1]
-                top_index = int(sorted_indices[0])
-                confidence = float(probabilities[top_index])
-                second_confidence = (
-                    float(probabilities[sorted_indices[1]])
-                    if len(sorted_indices) > 1
-                    else 0.0
-                )
+                if probabilities.size == 0:
+                    continue
+
+                if probabilities.size == 1:
+                    top_index = int(np.argmax(probabilities))
+                    confidence = float(probabilities[top_index])
+                    second_confidence = 0.0
+                else:
+                    top2_indices = np.argpartition(probabilities, -2)[-2:]
+                    sorted_top2 = top2_indices[
+                        np.argsort(probabilities[top2_indices])[::-1]
+                    ]
+                    top_index = int(sorted_top2[0])
+                    confidence = float(probabilities[top_index])
+                    second_confidence = float(probabilities[sorted_top2[1]])
+
                 confidence_gap = confidence - second_confidence
-                predicted_character = label_encoder.inverse_transform([top_index])[0]
+                predicted_character = index_to_label[top_index]
 
                 is_dynamic_like = predicted_character in DYNAMIC_LIKE
                 min_confidence = (
@@ -665,10 +678,18 @@ def main() -> None:
                     active_label_since = None
 
             composed_text = "".join(confirmed_text)
-            suggestions = suggester.suggest(composed_text)
+
+            if composed_text != cached_text:
+                suggestions = tuple(suggester.suggest(composed_text))
+                cached_text = composed_text
+                cached_suggestions = suggestions
+            else:
+                suggestions = cached_suggestions
 
             cv2.imshow(WINDOW_NAME, frame)
-            text_display.update(composed_text, suggestions)
+            if last_display_payload != (composed_text, suggestions):
+                text_display.update(composed_text, suggestions)
+                last_display_payload = (composed_text, suggestions)
             if not text_display.pump_events() or cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
