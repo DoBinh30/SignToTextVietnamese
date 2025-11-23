@@ -11,7 +11,7 @@ import numpy as np
 DATA_DIR = Path("data/images")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-LABELS = ["8", "10", "11", "12", "13", "14"]
+LABELS = ["DELETE_CHARACTER"]
 DATASET_SIZE = 300
 
 
